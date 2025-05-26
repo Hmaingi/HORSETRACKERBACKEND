@@ -1,0 +1,315 @@
+#include <SPI.h>
+#if defined(USE_SD_CARD)
+  #include <SD.h>
+#else
+#endif
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SoftwareSerial.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <MAX30100_PulseOximeter.h>
+#include <TinyGPS++.h>
+#include <ArduinoJson.h>  // <-- Include ArduinoJson for parsing
+
+// --- PIN CONFIGURATION ---
+#define ONE_WIRE_BUS 4
+#define SIM800_TX 26
+#define SIM800_RX 27
+#define SIM800_PWR 12
+#define BATTERY_PIN 35
+#define GPS_RX 16
+#define GPS_TX 17
+
+// SD Card SPI Pins
+#define SD_CS   5
+#define SD_SCK  18
+#define SD_MOSI 23
+#define SD_MISO 19
+
+// --- GLOBAL OBJECTS ---
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+MPU6050 mpu;
+PulseOximeter pox;
+SoftwareSerial sim800l(SIM800_TX, SIM800_RX);
+HardwareSerial GPS_Serial(1);
+TinyGPSPlus gps;
+
+// --- CONFIGURATION ---
+const char* ssid = "NE_Ki-92";
+const char* password = "LMaingi@123";
+const char* serverUrl = "https://horsetrackerbackend.onrender.com/api/data";
+const char* apn = "your_apn";
+const char* deviceId = "device123";
+
+// --- TIMING AND RETRY ---
+unsigned long lastSendTime = 0;
+unsigned long sendInterval = 60000;
+uint8_t retryCount = 0;
+
+// --- SENSOR DATA STRUCTURE ---
+struct SensorData {
+  float temp, ax, ay, az, hr, spo2, battery;
+  float lat, lon, alt;
+  unsigned long fixTime;
+};
+
+// --- FUNCTION PROTOTYPES ---
+#if defined(USE_SD_CARD)
+bool initSDCard();
+void logToSD(const String &data);
+#else
+bool initSDCard() { return true; }
+void logToSD(const String &data) {}
+#endif
+void readSensors(SensorData &data);
+bool sendData(const String &payload);
+bool sendDataViaWiFi(const String &payload);
+bool sendDataViaCellular(const String &payload);
+void setupSIM800L();
+bool connectGPRS();
+void checkGPS(SensorData &data);
+String createPayload(const SensorData &data);
+
+// --- SETUP ---
+void setup() {
+  Serial.begin(115200);
+
+#if defined(USE_SD_CARD)
+  if (!initSDCard()) {
+    Serial.println("SD card initialization failed!");
+    while(1);
+  }
+#else
+  Serial.println("SD card usage disabled. Skipping SD initialization.");
+#endif
+
+  Wire.begin();
+  ds18b20.begin();
+  mpu.initialize();
+  pox.begin();
+
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  sim800l.begin(9600);
+  pinMode(SIM800_PWR, OUTPUT);
+  digitalWrite(SIM800_PWR, HIGH);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFailed to connect to WiFi");
+  }
+}
+
+#if defined(USE_SD_CARD)
+bool initSDCard() {
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  int retries = 5;
+  while(retries--) {
+    if(SD.begin(SD_CS)) {
+      Serial.println("SD card initialized successfully");
+      return true;
+    }
+    Serial.println("SD card initialization failed, retrying...");
+    delay(500);
+  }
+  return false;
+}
+#endif
+
+// --- MAIN LOOP ---
+void loop() {
+  SensorData data = {0};
+
+  readSensors(data);
+
+  // --- Added debug prints to confirm MPU6050 and MAX30100 data ---
+  Serial.print("MPU6050 Accel (g): X=");
+  Serial.print(data.ax, 3);
+  Serial.print(" Y=");
+  Serial.print(data.ay, 3);
+  Serial.print(" Z=");
+  Serial.println(data.az, 3);
+
+  Serial.print("MAX30100 HR: ");
+  Serial.print(data.hr);
+  Serial.print(" bpm, SpO2: ");
+  Serial.print(data.spo2);
+  Serial.println(" %");
+  // -------------------------------------------------------------
+
+  checkGPS(data);
+
+  String payload = createPayload(data);
+  logToSD(payload);
+
+  if (millis() - lastSendTime > sendInterval) {
+    if (sendData(payload)) {
+      retryCount = 0;
+      sendInterval = 60000;
+      lastSendTime = millis();
+    } else {
+      retryCount++;
+      sendInterval = min(60000UL * (1UL << retryCount), 3600000UL);
+    }
+  }
+
+  pox.update();
+  delay(1000);
+}
+
+// --- SENSOR READING ---
+void readSensors(SensorData &data) {
+  ds18b20.requestTemperatures();
+  data.temp = ds18b20.getTempCByIndex(0);
+
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  data.ax = ax / 16384.0;
+  data.ay = ay / 16384.0;
+  data.az = az / 16384.0;
+
+  data.hr = pox.getHeartRate();
+  data.spo2 = pox.getSpO2();
+
+  int raw = analogRead(BATTERY_PIN);
+  data.battery = raw * (3.3 / 4095.0) * 2.0;
+}
+
+void checkGPS(SensorData &data) {
+  while (GPS_Serial.available() > 0) {
+    if (gps.encode(GPS_Serial.read())) {
+      if (gps.location.isUpdated() && gps.location.isValid()) {
+        data.lat = gps.location.lat();
+        data.lon = gps.location.lng();
+        data.alt = gps.altitude.meters();
+        data.fixTime = gps.time.value();
+      }
+    }
+  }
+}
+
+String createPayload(const SensorData &data) {
+  char buffer[512];
+  snprintf(buffer, sizeof(buffer),
+    "{\"deviceId\":\"%s\",\"temperature\":%.2f,\"accelerationX\":%.2f,\"accelerationY\":%.2f,\"accelerationZ\":%.2f,"
+    "\"heartRate\":%.1f,\"spo2\":%.1f,\"batteryLevel\":%.2f,"
+    "\"latitude\":%.6f,\"longitude\":%.6f,\"altitude\":%.2f,\"fixTime\":%lu}",
+    deviceId,
+    data.temp, data.ax, data.ay, data.az,
+    data.hr, data.spo2, data.battery,
+    data.lat, data.lon, data.alt, data.fixTime
+  );
+  return String(buffer);
+}
+
+// --- DATA LOGGING ---
+#if defined(USE_SD_CARD)
+void logToSD(const String &data) {
+  File file = SD.open("/log.txt", FILE_APPEND);
+  if (file) {
+    file.println(data);
+    file.close();
+  } else {
+    Serial.println("Error opening log file");
+  }
+}
+#endif
+
+// --- DATA SENDING ---
+bool sendData(const String &payload) {
+  return (WiFi.status() == WL_CONNECTED) ? sendDataViaWiFi(payload) : sendDataViaCellular(payload);
+}
+
+bool sendDataViaWiFi(const String &payload) {
+  HTTPClient http;
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  Serial.println("[HTTP] Attempting to send data to backend...");
+  Serial.println("Payload: " + payload);
+
+  int httpCode = http.POST(payload);
+
+  if(httpCode > 0) {
+    Serial.printf("[HTTP] Response code: %d\n", httpCode);
+    String response = http.getString();
+    Serial.println("[HTTP] Server response: " + response);
+
+    // --- Parse JSON response ---
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, response);
+    if (!error) {
+      bool success = doc["success"] | false;
+      const char* horseId = doc["horseId"] | "unknown";
+      Serial.print("Parsed response - success: ");
+      Serial.print(success);
+      Serial.print(", horseId: ");
+      Serial.println(horseId);
+    } else {
+      Serial.print("Failed to parse JSON response: ");
+      Serial.println(error.c_str());
+    }
+  } else {
+    Serial.printf("[HTTP] Failed to send, error: %s\n", http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+  return (httpCode == 200 || httpCode == 201);
+}
+
+bool sendDataViaCellular(const String &payload) {
+  setupSIM800L();
+  if (!connectGPRS()) return false;
+
+  sim800l.println("AT+HTTPINIT");
+  delay(100);
+  sim800l.println("AT+HTTPPARA=\"CID\",1");
+  delay(100);
+  sim800l.print("AT+HTTPPARA=\"URL\",\"");
+  sim800l.print(serverUrl);
+  sim800l.println("\"");
+  delay(100);
+  sim800l.print("AT+HTTPDATA=");
+  sim800l.print(payload.length());
+  sim800l.println(",10000");
+  delay(100);
+  sim800l.print(payload);
+  delay(10000);
+  sim800l.println("AT+HTTPACTION=1");
+  delay(1000);
+  sim800l.println("AT+HTTPTERM");
+  return true;
+}
+
+void setupSIM800L() {
+  sim800l.println("AT");
+  delay(100);
+  sim800l.println("ATE0");
+  delay(100);
+}
+
+bool connectGPRS() {
+  sim800l.println("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"");
+  delay(100);
+  sim800l.print("AT+SAPBR=3,1,\"APN\",\"");
+  sim800l.print(apn);
+  sim800l.println("\"");
+  delay(100);
+  sim800l.println("AT+SAPBR=1,1");
+  delay(3000);
+  return true;
+}
