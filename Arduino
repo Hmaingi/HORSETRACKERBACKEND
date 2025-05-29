@@ -1,18 +1,16 @@
 #include <SPI.h>
 #if defined(USE_SD_CARD)
   #include <SD.h>
-#else
 #endif
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <SoftwareSerial.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Wire.h>
 #include <MPU6050.h>
 #include <MAX30100_PulseOximeter.h>
 #include <TinyGPS++.h>
-#include <ArduinoJson.h>  // <-- Include ArduinoJson for parsing
+#include <ArduinoJson.h>
 
 // --- PIN CONFIGURATION ---
 #define ONE_WIRE_BUS 4
@@ -34,8 +32,10 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
 MPU6050 mpu;
 PulseOximeter pox;
-SoftwareSerial sim800l(SIM800_TX, SIM800_RX);
-HardwareSerial GPS_Serial(1);
+
+// Replaced SoftwareSerial with HardwareSerial for SIM800L
+HardwareSerial sim800l(2);  // Using UART2 for SIM800L
+HardwareSerial GPS_Serial(1);  // Using UART1 for GPS
 TinyGPSPlus gps;
 
 // --- CONFIGURATION ---
@@ -92,19 +92,24 @@ void setup() {
   mpu.initialize();
   pox.begin();
 
+  // Setup GPS
   GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-  sim800l.begin(9600);
+
+  // Setup SIM800L using UART2
+  sim800l.begin(9600, SERIAL_8N1, SIM800_RX, SIM800_TX);
+
   pinMode(SIM800_PWR, OUTPUT);
   digitalWrite(SIM800_PWR, HIGH);
 
   WiFi.begin(ssid, password);
-
   Serial.print("Connecting to WiFi");
+
   unsigned long startAttemptTime = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
     delay(500);
     Serial.print(".");
   }
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi connected!");
     Serial.print("IP Address: ");
@@ -136,20 +141,8 @@ void loop() {
 
   readSensors(data);
 
-  // --- Added debug prints to confirm MPU6050 and MAX30100 data ---
-  Serial.print("MPU6050 Accel (g): X=");
-  Serial.print(data.ax, 3);
-  Serial.print(" Y=");
-  Serial.print(data.ay, 3);
-  Serial.print(" Z=");
-  Serial.println(data.az, 3);
-
-  Serial.print("MAX30100 HR: ");
-  Serial.print(data.hr);
-  Serial.print(" bpm, SpO2: ");
-  Serial.print(data.spo2);
-  Serial.println(" %");
-  // -------------------------------------------------------------
+  Serial.printf("MPU6050 Accel (g): X=%.3f Y=%.3f Z=%.3f\n", data.ax, data.ay, data.az);
+  Serial.printf("MAX30100 HR: %.1f bpm, SpO2: %.1f %%\n", data.hr, data.spo2);
 
   checkGPS(data);
 
@@ -239,7 +232,7 @@ bool sendDataViaWiFi(const String &payload) {
   http.begin(serverUrl);
   http.addHeader("Content-Type", "application/json");
 
-  Serial.println("[HTTP] Attempting to send data to backend...");
+  Serial.println("[HTTP] Sending data to backend...");
   Serial.println("Payload: " + payload);
 
   int httpCode = http.POST(payload);
@@ -249,18 +242,14 @@ bool sendDataViaWiFi(const String &payload) {
     String response = http.getString();
     Serial.println("[HTTP] Server response: " + response);
 
-    // --- Parse JSON response ---
     StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, response);
     if (!error) {
       bool success = doc["success"] | false;
       const char* horseId = doc["horseId"] | "unknown";
-      Serial.print("Parsed response - success: ");
-      Serial.print(success);
-      Serial.print(", horseId: ");
-      Serial.println(horseId);
+      Serial.printf("Parsed response - success: %d, horseId: %s\n", success, horseId);
     } else {
-      Serial.print("Failed to parse JSON response: ");
+      Serial.print("Failed to parse JSON: ");
       Serial.println(error.c_str());
     }
   } else {
@@ -313,3 +302,4 @@ bool connectGPRS() {
   delay(3000);
   return true;
 }
+
